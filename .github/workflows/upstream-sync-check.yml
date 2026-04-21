@@ -1,0 +1,120 @@
+name: Upstream Sync Check
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure upstream remote
+        run: |
+          git remote add upstream https://github.com/nousresearch/hermes-agent.git
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Compare origin/main with upstream/main
+        id: compare
+        run: |
+          set -euo pipefail
+
+          behind_count=$(git rev-list --count origin/main..upstream/main)
+          ahead_count=$(git rev-list --count upstream/main..origin/main)
+
+          echo "behind_count=$behind_count" >> "$GITHUB_OUTPUT"
+          echo "ahead_count=$ahead_count" >> "$GITHUB_OUTPUT"
+
+      - name: Report sync status in summary
+        run: |
+          echo "## Upstream Sync Status" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Upstream branch: upstream/main" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Fork branch: origin/main" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Behind count: ${{ steps.compare.outputs.behind_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Ahead count: ${{ steps.compare.outputs.ahead_count }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update issue when fork is behind
+        if: steps.compare.outputs.behind_count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = '[Upstream Sync] Fork is behind upstream/main';
+            const label = 'upstream-sync';
+
+            const behind = '${{ steps.compare.outputs.behind_count }}';
+            const ahead = '${{ steps.compare.outputs.ahead_count }}';
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            // Ensure label exists.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: 'FBCA04',
+                description: 'Fork is behind upstream and needs sync',
+              });
+            }
+
+            const openIssues = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              labels: label,
+              per_page: 100,
+            });
+
+            const existing = openIssues.data.find((issue) => issue.title === title);
+
+            const body = [
+              'Your fork is behind the upstream repository.',
+              '',
+              `- Behind: **${behind}** commit(s)`,
+              `- Ahead: **${ahead}** commit(s)`,
+              `- Workflow run: ${runUrl}`,
+              '',
+              'Suggested local sync commands:',
+              '```bash',
+              'git fetch upstream',
+              'git checkout main',
+              'git pull --rebase upstream main',
+              'git push origin main',
+              '```',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: `Still behind upstream as of this run.\n\n${body}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body,
+                labels: [label],
+              });
+            }
+
+      - name: Log when fork is up to date
+        if: steps.compare.outputs.behind_count == '0'
+        run: echo "Fork is up to date with upstream/main."
